@@ -5,8 +5,8 @@
 # 📢 Rule
 
 * 각자 브랜치를 생성하여 개발을 진행합니다.
-* `main` 브랜치는 <span style="color: red;">PR을 통해서만 머지</span>할 수 있습니다.
-* `main` 브랜치 <span style="color: red;">PR은 2명 이상의 동의</span>가 필요합니다.
+* `main` 브랜치는 PR을 통해서만 머지할 수 있습니다.
+* `main` 브랜치 PR은 2명 이상의 동의가 필요합니다.
 * 필요한 의존성은 requirements.txt 파일에 기록합니다.
 
 ### 예시 - Quantization 연구
