@@ -21,15 +21,15 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 from OverNet import LDGs
-from dataset import TrainDataset, TestDataset
+from dataset import TrainDataset
 from quantization.ops import fake_quantize
-from quantization.eval import evaluate
+from quantization.eval import evaluate, TestDataset
 
 DEFAULT_QUANT_BIT = 8
-DEFAULT_BATCH_SIZE = 32
+DEFAULT_BATCH_SIZE = 4
 
 class Quant2d(nn.Module):
-    def __init__(self, conv2d:nn.Conv2d, boundaries:dict) -> None:
+    def __init__(self, conv2d:nn.Conv2d, boundaries:dict, n_bits:int) -> None:
         super().__init__()
         
         self.register_buffer('weight', conv2d.weight.data.cpu())
@@ -45,14 +45,15 @@ class Quant2d(nn.Module):
         self.l_a = nn.Parameter(boundaries['l_a'])
         self.u_a = nn.Parameter(boundaries['u_a'])
         
+        self.n_bits = n_bits
         self.stride = conv2d.stride
         self.padding = conv2d.padding
         self.dilation = conv2d.dilation
         self.groups = conv2d.groups
     
     def forward(self, x:Tensor) -> Tensor:
-        q_w = fake_quantize(self.weight, self.l_w, self.u_w)
-        q_x = fake_quantize(x, self.l_a, self.u_a)
+        q_w = fake_quantize(self.weight, self.l_w, self.u_w, self.n_bits)
+        q_x = fake_quantize(x, self.l_a, self.u_a, self.n_bits)
         return F.conv2d(q_x, q_w, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
 
@@ -137,7 +138,7 @@ def get_boundaries(model:nn.Module, calib_loader:DataLoader, scale:int, upscale:
         
     for name, tensors in activations.items():
         tensor = torch.cat(tensors).transpose(0, 1)
-        l_a, u_a, is_zero_base = calibrate_dobi(tensor, K)
+        l_a, u_a, is_zero_base = calibrate_dobi(tensor, K, n_bits)
         l_a = l_a.view(1, -1, 1, 1)
         u_a = u_a.view(1, -1, 1, 1)
         boundaries[name]['l_a'] = l_a.cpu()
@@ -152,19 +153,20 @@ def get_boundaries(model:nn.Module, calib_loader:DataLoader, scale:int, upscale:
         
     return boundaries
 
-def quantize_dobi(model:nn.Module, boundaries:dict, name:str) -> None:
+def quantize_dobi(model:nn.Module, boundaries:dict, name:str, n_bits:int) -> None:
     """Quantize every Conv2d model into Quant2d
 
     Args:
         model (nn.Module): target model to quantize
         boundaries (dict): boundary info of weights and activations
         name (str): module name
+        n_bits (int): n bits quantization
     """
     for module_name, module in model.named_children():
         if isinstance(module, nn.Conv2d):
-            setattr(model, module_name, Quant2d(module, boundaries['.'.join([name, module_name])[1:]]))
+            setattr(model, module_name, Quant2d(module, boundaries['.'.join([name, module_name])[1:]], n_bits))
         else:
-            quantize_dobi(module, boundaries, '.'.join([name, module_name]))
+            quantize_dobi(module, boundaries, '.'.join([name, module_name]), n_bits)
             
 
 def distilate(
@@ -204,7 +206,7 @@ def distilate(
     def hook_for_student(name, module, x, y):
         tensor = y.detach()
         tensor = tensor / torch.norm(tensor)
-        caches[name] = coeff * F.mse_loss(caches[name], tensor)
+        caches[name] = coeff * F.mse_loss(tensor, caches[name])
         
     for param in teacher.parameters():
         param.requires_grad = False
@@ -221,9 +223,9 @@ def distilate(
                 params = list(module.parameters())
             else:
                 params = params + list(module.parameters())
-        else:
-            for p in module.parameters():
-                p.requires_grad = False
+        # else:
+        #     for p in module.parameters():
+        #         p.requires_grad = False
     
     optimizer = Adam(params)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
@@ -245,14 +247,14 @@ def distilate(
         total_out_loss = 0
         total_gdg_loss = 0
         
-        for _, inputs in enumerate(calib_loader):
+        for step, inputs in enumerate(calib_loader):
             optimizer.zero_grad()
             
-            lr = inputs[1].to(device)
+            lr = inputs[0][1].to(device)
             output_teacher = teacher(lr, scale, upscale)
             output_student = student(lr, scale, upscale)
             
-            out_loss = F.l1_loss(output_teacher, output_student)
+            out_loss = F.l1_loss(output_student, output_teacher)
             gdg_loss = 0
             for _, items in caches.items():
                 gdg_loss = gdg_loss + items
@@ -263,7 +265,7 @@ def distilate(
             loss.backward()
             optimizer.step()
             
-            caches = {}
+            caches.clear()
             torch.cuda.empty_cache()
         
         scheduler.step()
@@ -285,39 +287,37 @@ def distilate(
 # def quantize(model:nn.Module, )
 def quantize(
     model:nn.Module,
-    calib_dir:str,
-    val_dir:str,
+    calib_data:str,
+    val_data:str,
     scale:int,
     upscale:int,
     device:Optional[DeviceLikeType],
-    dobi_batch_size:int=DEFAULT_BATCH_SIZE,
     calib_batch_size:int=DEFAULT_BATCH_SIZE,
-    val_batch_size:int=DEFAULT_BATCH_SIZE,
     n_bits = DEFAULT_QUANT_BIT,
 ) -> None:
     """Quantize model using 2DQuant
 
     Args:
         model (nn.Module): target model
-        calib_dir (str): directory of calibration dataset
-        val_dir (str): directory of validation dataset
+        calib_data (str): directory of calibration dataset. it must have more than 32 data
+        val_data (str): directory of validation dataset
         scale (int): scale for model inference
         upscale (int): upscale for model inference
         device (Optional[DeviceLikeType]): device for inference and training.
     """
     
     model.to(device)
-    dobi_calib_dataset = TrainDataset(calib_dir, scale)
-    dobi_calib_loader = DataLoader(dobi_calib_dataset, dobi_batch_size, True)
+    dobi_calib_dataset = TrainDataset(calib_data, 64, scale)
+    dobi_calib_loader = DataLoader(dobi_calib_dataset, 32, True)
     boundaries = get_boundaries(model, dobi_calib_loader, scale, upscale, n_bits)
     
     teacher = deepcopy(model)
     model.cpu()
-    quantize_dobi(model, boundaries, '')
+    quantize_dobi(model, boundaries, '', n_bits)
     model.to(device)
     
-    calib_dataset = TestDataset(calib_dir, scale, True)
-    calib_loader = DataLoader(calib_dataset, calib_batch_size, False)
-    val_dataset = TestDataset(val_dir, scale, True)
-    val_loader = DataLoader(val_dataset, val_batch_size, False)
+    calib_dataset = TrainDataset(calib_data, 64, scale)
+    calib_loader = DataLoader(calib_dataset, calib_batch_size, True)
+    val_dataset = TestDataset(val_data, scale)
+    val_loader = DataLoader(val_dataset, 1, False)
     distilate(teacher, model, calib_loader, val_loader, scale, upscale)
