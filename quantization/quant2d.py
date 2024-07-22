@@ -204,7 +204,9 @@ def distilate(
         caches[name] = tensor
     
     def hook_for_student(name, module, x, y):
-        tensor = y.detach()
+        if name not in caches:
+            return
+        tensor = y
         tensor = tensor / torch.norm(tensor)
         caches[name] = coeff * F.mse_loss(tensor, caches[name])
         
@@ -223,9 +225,6 @@ def distilate(
                 params = list(module.parameters())
             else:
                 params = params + list(module.parameters())
-        # else:
-        #     for p in module.parameters():
-        #         p.requires_grad = False
     
     optimizer = Adam(params)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
@@ -247,7 +246,7 @@ def distilate(
         total_out_loss = 0
         total_gdg_loss = 0
         
-        for step, inputs in enumerate(calib_loader):
+        for _, inputs in enumerate(calib_loader):
             optimizer.zero_grad()
             
             lr = inputs[0][1].to(device)
@@ -283,41 +282,3 @@ def distilate(
         
     for hook in hooks:
         hook.remove()
-
-# def quantize(model:nn.Module, )
-def quantize(
-    model:nn.Module,
-    calib_data:str,
-    val_data:str,
-    scale:int,
-    upscale:int,
-    device:Optional[DeviceLikeType],
-    calib_batch_size:int=DEFAULT_BATCH_SIZE,
-    n_bits = DEFAULT_QUANT_BIT,
-) -> None:
-    """Quantize model using 2DQuant
-
-    Args:
-        model (nn.Module): target model
-        calib_data (str): directory of calibration dataset. it must have more than 32 data
-        val_data (str): directory of validation dataset
-        scale (int): scale for model inference
-        upscale (int): upscale for model inference
-        device (Optional[DeviceLikeType]): device for inference and training.
-    """
-    
-    model.to(device)
-    dobi_calib_dataset = TrainDataset(calib_data, 64, scale)
-    dobi_calib_loader = DataLoader(dobi_calib_dataset, 32, True)
-    boundaries = get_boundaries(model, dobi_calib_loader, scale, upscale, n_bits)
-    
-    teacher = deepcopy(model)
-    model.cpu()
-    quantize_dobi(model, boundaries, '', n_bits)
-    model.to(device)
-    
-    calib_dataset = TrainDataset(calib_data, 64, scale)
-    calib_loader = DataLoader(calib_dataset, calib_batch_size, True)
-    val_dataset = TestDataset(val_data, scale)
-    val_loader = DataLoader(val_dataset, 1, False)
-    distilate(teacher, model, calib_loader, val_loader, scale, upscale)
