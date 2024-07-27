@@ -2,11 +2,10 @@
 
 import os
 import sys
-import glob
+import random
 from tqdm import tqdm
-from copy import deepcopy
 from functools import partial
-from typing import Optional
+from datetime import datetime
 
 
 import torch
@@ -14,16 +13,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.utils.data import DataLoader
-from torch._prims_common import DeviceLikeType
+# from torch._prims_common import DeviceLikeType
 from torch.optim import Adam
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 
 
 from OverNet import LDGs
-from dataset import TrainDataset
+# from dataset import TrainDataset
 from quantization.ops import fake_quantize
-from quantization.eval import evaluate, TestDataset
+from quantization.eval import evaluate, infer, TestDataset
 
 DEFAULT_QUANT_BIT = 8
 DEFAULT_BATCH_SIZE = 4
@@ -134,7 +133,7 @@ def get_boundaries(model:nn.Module, calib_loader:DataLoader, scale:int, upscale:
             }
             module.register_forward_hook(partial(func_hook, name))
         
-    evaluate(model, calib_loader, scale, upscale, 1)
+    infer(model, calib_loader, 1)
         
     for name, tensors in activations.items():
         tensor = torch.cat(tensors).transpose(0, 1)
@@ -174,9 +173,7 @@ def distilate(
     student:nn.Module, 
     calib_loader:DataLoader,
     val_loader:DataLoader,
-    scale:int,
-    upscale:int,
-    coeff=5, 
+    coeff=10000, 
     epochs=3000
 ) -> None:
     """Fine-tune cliping range
@@ -186,8 +183,6 @@ def distilate(
         student (nn.Module): dobi quantized model
         calib_loader (DataLoader): calibration data loader
         val_loader (DataLoader): validation data loader
-        scale (int): scale
-        upscale (int): upscale
         coeff (int, optional): co-efficient of output and feature loss. defaults to 5.
         epochs (int, optional): training iterations. defaults to 3000.
     """
@@ -229,7 +224,8 @@ def distilate(
     optimizer = Adam(params)
     scheduler = CosineAnnealingLR(optimizer, T_max=epochs)
     
-    checkpoint_dir = os.path.join('data', 'quantization', 'checkpoints')
+    checkpoint_dir = os.path.join('data', 'quantization', f'{datetime.now().strftime("%Y:%m:%d_%H:%M:%S")}')
+    print(f'create {checkpoint_dir} directory')
     os.makedirs(checkpoint_dir, exist_ok=True)
     def save_checkpoint(filename):
         torch.save({
@@ -249,9 +245,16 @@ def distilate(
         for _, inputs in enumerate(calib_loader):
             optimizer.zero_grad()
             
-            lr = inputs[0][1].to(device)
-            output_teacher = teacher(lr, scale, upscale)
-            output_student = student(lr, scale, upscale)
+            sc_idx = random.randint(0, len(inputs)-1)
+            hr, lr = inputs[sc_idx][0], inputs[sc_idx][1]
+            
+            scale1, scale2 = hr.size(2) / lr.size(2), hr.size(3) / lr.size(3)
+            teacher.set_scale(scale1, scale2)
+            student.set_scale(scale1, scale2)
+            
+            lr = lr.to(device)
+            output_teacher = teacher(lr, scale1, scale2)
+            output_student = student(lr, scale1, scale2)
             
             out_loss = F.l1_loss(output_student, output_teacher)
             gdg_loss = 0
@@ -274,7 +277,7 @@ def distilate(
             [GDG Layer: {total_gdg_loss / steps}, OUTPUT: {total_out_loss / steps}]")
         save_checkpoint(f'calib_{epoch+1}.pt')
         
-        psnr = evaluate(student, val_loader, scale, upscale)
+        psnr = evaluate(student, val_loader)
         print(f"PSNR score is {psnr}")
         if psnr > best_psnr:
             best_psnr = psnr
