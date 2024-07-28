@@ -54,7 +54,9 @@ class Quant2d(nn.Module):
         q_w = fake_quantize(self.weight, self.l_w, self.u_w, self.n_bits)
         q_x = fake_quantize(x, self.l_a, self.u_a, self.n_bits)
         return F.conv2d(q_x, q_w, self.bias, self.stride, self.padding, self.dilation, self.groups)
-
+    
+    def get_buffer_size(self) -> float:
+        return (self.weight.nelement() + self.bias.nelement()) / 8 * self.n_bits
 
 def calibrate_dobi(tensor:Tensor, K:int, n_bits:int) -> tuple[Tensor, Tensor, bool]:
     """Distribution-Oriented Bound Initialization
@@ -285,3 +287,21 @@ def distilate(
         
     for hook in hooks:
         hook.remove()
+
+
+def get_model_size(model):
+    """Calculate model size(KB)
+
+    Args:
+        model (nn.Module): target model
+    """
+    size = 0
+    for param in model.parameters():
+        param_size = param.nelement() * param.element_size()
+        size += param_size
+        
+    for _, module in model.named_modules():
+        if isinstance(module, Quant2d):
+            size += module.get_buffer_size()
+    
+    return size // 1024

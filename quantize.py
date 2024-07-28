@@ -4,7 +4,7 @@ from dataset import TrainDataset
 from torch.utils.data import DataLoader
 
 from OverNet import Network
-from quantization.quant2d import get_boundaries, quantize_dobi, distilate
+from quantization.quant2d import get_boundaries, quantize_dobi, distilate, get_model_size
 from quantization.eval import TestDataset
 
 def load_model(checkpoint):
@@ -36,10 +36,13 @@ def main(args):
     batch_size, coeff = args.batch_size, args.coeff
     
     teacher, student = load_model(args.checkpoint)
+    print(f'original model size is {get_model_size(teacher)} KB')
     teacher.to(device)
     student.to(device)
     
     quantize(student, calib_data, n_bits, device)
+    print(f'model size after quantization is {get_model_size(student)} KB')
+    
     calibrate(teacher, student, calib_data, val_data, batch_size, coeff)
     
 if __name__ == '__main__':
